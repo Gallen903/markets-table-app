@@ -2,3 +2,4 @@ streamlit
 yfinance
 pandas
 boto3
+exchange_calendars
