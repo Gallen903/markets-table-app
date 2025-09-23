@@ -165,7 +165,7 @@ def init_db_with_defaults():
         ("GFTU.L","Grafton Group plc","UK","GBp"),
         ("HVO.L","hVIVO plc","UK","GBp"),
         ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
-        ("TSCOL.L","Tesco plc","UK","GBp"),
+        ("TSCO.L","Tesco plc","UK","GBp"),
         ("BRBY.L","Burberry","UK","GBp"),
         ("SSPG.L","SSP Group","UK","GBp"),
         ("ABF.L","Associated British Foods","UK","GBp"),
