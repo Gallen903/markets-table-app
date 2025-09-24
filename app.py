@@ -7,6 +7,7 @@ import sqlite3
 import io
 import csv
 import os
+import base64
 from typing import Optional
 
 # --- HTTP (requests preferred; fallback to stdlib urllib) ---
@@ -33,60 +34,150 @@ except Exception:
 
 DB_PATH = "stocks.db"
 
-# -----------------------------
-# Optional S3 backup/restore for DB
-# -----------------------------
-def _s3_client_from_secrets():
-    """
-    Creates a boto3 S3 client if secrets are present.
-    Expected st.secrets:
-      S3_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, (optional) S3_REGION
-    Returns (s3_client, bucket) or (None, None) if not configured / boto3 missing.
-    """
-    try:
-        import boto3
-        if "S3_BUCKET" not in st.secrets:
-            return None, None
-        bucket = st.secrets["S3_BUCKET"]
-        ak = st.secrets.get("AWS_ACCESS_KEY_ID")
-        sk = st.secrets.get("AWS_SECRET_ACCESS_KEY")
-        region = st.secrets.get("S3_REGION", None)
-        if not (ak and sk and bucket):
-            return None, None
-        session = boto3.session.Session(
-            aws_access_key_id=ak,
-            aws_secret_access_key=sk,
-            region_name=region,
-        )
-        return session.client("s3"), bucket
-    except Exception:
-        return None, None
+# =============================
+# GitHub-backed storage (CSV in repo)
+# =============================
+GH_STOCKS_PATH = "data/stocks.csv"
+GH_BASELINES_PATH = "data/reference_prices.csv"
 
-def restore_db_from_s3():
-    s3, bucket = _s3_client_from_secrets()
-    if not s3:
-        return False
-    key = "stocks.db"
-    try:
-        s3.download_file(bucket, key, DB_PATH)
-        return True
-    except Exception:
-        return False
+def _gh_headers():
+    tok = st.secrets.get("GITHUB_TOKEN")
+    if not tok:
+        return None
+    return {
+        "Authorization": f"token {tok}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "streamlit-app"
+    }
 
-def backup_db_to_s3():
-    s3, bucket = _s3_client_from_secrets()
-    if not s3 or not os.path.exists(DB_PATH):
-        return False
-    key = "stocks.db"
-    try:
-        s3.upload_file(DB_PATH, bucket, key)
-        return True
-    except Exception:
-        return False
+def _gh_repo():
+    repo = st.secrets.get("GITHUB_REPO")
+    branch = st.secrets.get("GITHUB_BRANCH", "main")
+    return repo, branch
 
-# -----------------------------
-# SQLite helpers
-# -----------------------------
+def gh_get_file(path: str):
+    headers = _gh_headers()
+    repo, branch = _gh_repo()
+    if not headers or not repo:
+        return None
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    try:
+        if _HTTP_LIB == "requests":
+            r = requests.get(url, params={"ref": branch}, headers=headers, timeout=20)
+            return r.json() if r.status_code == 200 else None
+        else:
+            full = f"{url}?{urllib.parse.urlencode({'ref': branch})}"
+            req = urllib.request.Request(full, headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                import json
+                return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+def gh_put_file(path: str, content_bytes: bytes, message: str, sha: Optional[str]):
+    headers = _gh_headers()
+    repo, branch = _gh_repo()
+    if not headers or not repo:
+        return False, "GitHub not configured"
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content_bytes).decode("ascii"),
+        "branch": branch
+    }
+    if sha:
+        payload["sha"] = sha
+    try:
+        if _HTTP_LIB == "requests":
+            r = requests.put(url, headers=headers, json=payload, timeout=30)
+            if r.status_code in (200, 201):
+                return True, "Committed"
+            return False, f"{r.status_code}: {r.text[:200]}"
+        else:
+            data = urllib.parse.urlencode(payload).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers=headers, method="PUT")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return True, "Committed"
+    except Exception as e:
+        return False, f"Commit failed: {e}"
+
+def seed_db_from_github():
+    """Fetch CSVs from repo and upsert into local SQLite tables."""
+    # stocks.csv
+    meta = gh_get_file(GH_STOCKS_PATH)
+    if meta and "content" in meta:
+        try:
+            csv_bytes = base64.b64decode(meta["content"])
+            df = pd.read_csv(io.BytesIO(csv_bytes), encoding="utf-8-sig", keep_default_na=False)
+            for _, r in df.iterrows():
+                t = str(r.get("ticker","")).strip()
+                n = str(r.get("name","")).strip()
+                rg = str(r.get("region","")).strip()
+                cu = str(r.get("currency","")).strip()
+                if t and n and rg and cu:
+                    db_add_stock(t, n, rg, cu)
+        except Exception:
+            pass
+
+    # reference_prices.csv
+    meta = gh_get_file(GH_BASELINES_PATH)
+    if meta and "content" in meta:
+        try:
+            csv_bytes = base64.b64decode(meta["content"])
+            df = pd.read_csv(io.BytesIO(csv_bytes), encoding="utf-8-sig", keep_default_na=False)
+            cols = {c.strip().lower(): c for c in df.columns}
+            req = {"ticker","year","price"}
+            if req.issubset(set(cols.keys())):
+                for _, r in df.iterrows():
+                    try:
+                        db_set_reference(
+                            str(r[cols["ticker"]]).strip(),
+                            int(pd.to_numeric(r[cols["year"]], errors="coerce")),
+                            float(pd.to_numeric(r[cols["price"]], errors="coerce")),
+                            None if "date" not in cols else (None if pd.isna(r[cols["date"]]) else str(r[cols["date"]])),
+                            None if "series" not in cols else (None if pd.isna(r[cols["series"]]) else str(r[cols["series"]])),
+                            None if "notes" not in cols else (None if pd.isna(r[cols["notes"]]) else str(r[cols["notes"]]))
+                        )
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+def sync_db_to_github(note: str = ""):
+    """Dump both tables to CSV and commit to repo."""
+    headers = _gh_headers()
+    if not headers or not _gh_repo()[0]:
+        return False, "GitHub not configured"
+
+    # Stocks
+    try:
+        stocks_now = db_all_stocks().sort_values("name")
+        s_buf = io.StringIO()
+        stocks_now.to_csv(s_buf, index=False)
+        s_bytes = s_buf.getvalue().encode("utf-8")
+        meta_s = gh_get_file(GH_STOCKS_PATH)
+        sha_s = meta_s.get("sha") if meta_s else None
+        ok1, msg1 = gh_put_file(GH_STOCKS_PATH, s_bytes, f"stocks: {note or 'sync'}", sha_s)
+    except Exception as e:
+        ok1, msg1 = False, f"stocks export failed: {e}"
+
+    # Baselines
+    try:
+        refs_all = db_all_references(None)
+        r_buf = io.StringIO()
+        refs_all.to_csv(r_buf, index=False)
+        r_bytes = r_buf.getvalue().encode("utf-8")
+        meta_r = gh_get_file(GH_BASELINES_PATH)
+        sha_r = meta_r.get("sha") if meta_r else None
+        ok2, msg2 = gh_put_file(GH_BASELINES_PATH, r_bytes, f"baselines: {note or 'sync'}", sha_r)
+    except Exception as e:
+        ok2, msg2 = False, f"baselines export failed: {e}"
+
+    return (ok1 and ok2), f"stocks={msg1}; baselines={msg2}"
+
+# =============================
+# SQLite helpers (local runtime DB)
+# =============================
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
@@ -108,9 +199,9 @@ def init_db_with_defaults():
             ticker TEXT NOT NULL,
             year   INTEGER NOT NULL,
             price  REAL NOT NULL,
-            date   TEXT,            -- optional yyyy-mm-dd (for your reference)
-            series TEXT,            -- optional: 'close'|'adjclose'
-            notes  TEXT,            -- optional free text
+            date   TEXT,
+            series TEXT,
+            notes  TEXT,
             PRIMARY KEY (ticker, year)
         )
     """)
@@ -147,30 +238,26 @@ def init_db_with_defaults():
         ("DEO","Diageo","US","USD"),
         ("AER","AerCap Holdings","US","USD"),
         ("FLUT","Flutter Entertainment plc","US","USD"),
-
         # --- Europe (non-UK, non-Ireland) ---
         ("HEIA.AS","Heineken N.V.","Europe","EUR"),
         ("BSN.F","Danone S.A.","Europe","EUR"),
         ("BKT.MC","Bankinter","Europe","EUR"),
-        # Added primaries:
         ("IBE.MC","Iberdrola S.A.","Europe","EUR"),    # Madrid (primary)
         ("ORSTED.CO","Orsted A/S","Europe","DKK"),     # Copenhagen (primary)
         ("ROG.SW","Roche Holding AG","Europe","CHF"),  # SIX Swiss (primary)
         ("SAN.PA","Sanofi","Europe","EUR"),            # Paris (primary)
-
         # --- UK ---
         ("VOD.L","Vodafone Group","UK","GBp"),
         ("DCC.L","DCC plc","UK","GBp"),
-        ("GNC.L","Greencore Group plc","UK","GBp"),
-        ("GFTU.L","Grafton Group plc","UK","GBp"),
+        ("GNCL.XC","Greencore Group plc","UK","GBp"),
+        ("GFTUL.XC","Grafton Group plc","UK","GBp"),
         ("HVO.L","hVIVO plc","UK","GBp"),
         ("POLB.L","Poolbeg Pharma PLC","UK","GBp"),
-        ("TSCO.L","Tesco plc","UK","GBp"),
+        ("TSCOL.XC","Tesco plc","UK","GBp"),
         ("BRBY.L","Burberry","UK","GBp"),
         ("SSPG.L","SSP Group","UK","GBp"),
         ("ABF.L","Associated British Foods","UK","GBp"),
         ("GWMO.L","Great Western Mining Corp","UK","GBp"),
-
         # --- Ireland ---
         ("GVR.IR","Glenveagh Properties PLC","Ireland","EUR"),
         ("UPR.IR","Uniphar plc","Ireland","EUR"),
@@ -281,12 +368,10 @@ def _col(use_price_return: bool) -> str:
     return "Close" if use_price_return else "Adj Close"
 
 def _session_dates_index(df: pd.DataFrame) -> np.ndarray:
-    """Return array of date() for each row; treat rows as local session dates."""
     idx = pd.to_datetime(df.index)
     return np.array([d.date() for d in idx], dtype=object)
 
 def last_close_on_or_before_date(df: pd.DataFrame, target_date: date, use_price_return: bool):
-    """Get last session's price on/before target_date using chosen column."""
     if df.empty:
         return None, None
     dates = _session_dates_index(df)
@@ -387,7 +472,6 @@ def yahoo_ytd_via_chart(symbol: str, year: int, on_date: date, use_live_when_tod
 # -----------------------------
 # OFFICIAL EXCHANGE CALENDAR helpers (Option B)
 # -----------------------------
-# Map Yahoo suffix -> exchange calendar code
 CAL_BY_SUFFIX = {
     "IR": "XDUB",  # Dublin
     "PA": "XPAR",  # Paris
@@ -395,23 +479,18 @@ CAL_BY_SUFFIX = {
     "BR": "XBRU",  # Brussels
     "LS": "XLIS",  # Lisbon
     "L":  "XLON",  # London
-    "MC": "XMAD",  # Madrid (BME)
-    "CO": "XCSE",  # Copenhagen (Nasdaq Nordic)
+    "MC": "XMAD",  # Madrid
+    "CO": "XCSE",  # Copenhagen
     "SW": "XSWX",  # SIX Swiss
-    "DE": "XETR",  # Xetra (Frankfurt)
+    "DE": "XETR",  # Xetra
     "F":  "XFRA",  # Frankfurt floor
     "MI": "XMIL",  # Milan
 }
-
 def _suffix(sym: str) -> str:
     return sym.split(".")[-1].upper() if "." in sym else ""
-
 def ticker_calendar_code(ticker: str) -> Optional[str]:
-    suf = _suffix(ticker)
-    return CAL_BY_SUFFIX.get(suf)
-
+    return CAL_BY_SUFFIX.get(_suffix(ticker))
 def official_prev_year_last_session(ticker: str, year: int) -> Optional[date]:
-    """Return the official last trading SESSION DATE < Jan 1 of `year` for ticker's venue."""
     if not _HAS_XCALS:
         return None
     cal_code = ticker_calendar_code(ticker)
@@ -427,9 +506,7 @@ def official_prev_year_last_session(ticker: str, year: int) -> Optional[date]:
         return prev[-1].date() if len(prev) else None
     except Exception:
         return None
-
 def baseline_from_hist_on_or_before(hist: pd.DataFrame, session_date: date, use_price_return: bool) -> Optional[float]:
-    """Pick baseline from history at the requested session date (or the last available <= date)."""
     if hist is None or hist.empty:
         return None
     dates = _session_dates_index(hist)
@@ -447,7 +524,7 @@ def baseline_from_hist_on_or_before(hist: pd.DataFrame, session_date: date, use_
 # -----------------------------
 st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("📊 Stock Dashboard")
-st.caption("Last price, 5-day % change, and YTD % change. YTD can use official exchange calendars for the baseline (Europe) or Yahoo's chart feed.")
+st.caption("YTD can use official exchange calendars (Europe) or Yahoo’s chart feed. Manual baselines override when provided. Data persisted to your GitHub repo.")
 
 # Toggles
 use_price_return = st.toggle(
@@ -468,7 +545,7 @@ use_manual_baselines = st.toggle(
 use_official_calendars = st.toggle(
     "Use official exchange calendars for YTD baseline (Europe)",
     value=True,
-    help="Computes the baseline as the last official session < Jan 1 per venue (e.g., XDUB/XPAR/XAMS/XMAD/XCSE/XSWX). Falls back if calendar unavailable."
+    help="Baseline = last official session < Jan 1 per venue (XDUB/XPAR/XAMS/XMAD/XCSE/XSWX)."
 )
 # Rounding
 round_two_dp = st.toggle(
@@ -490,11 +567,14 @@ show_index_charts = st.checkbox(
     value=False
 )
 
-# ---- Restore DB from cloud (if configured) BEFORE we touch it
-if restore_db_from_s3():
-    st.info("✅ Restored database from cloud backup.")
-
+# ---- Init DB and seed from GitHub (if configured)
 init_db_with_defaults()
+if _gh_headers() and _gh_repo()[0]:
+    seed_db_from_github()
+    st.info("🔗 Seeded data from GitHub (if files present).")
+else:
+    st.warning("GitHub sync not configured (set GITHUB_* secrets) — using local ephemeral DB.")
+
 stocks_df = db_all_stocks()
 
 colA, colB = st.columns([1,1])
@@ -505,7 +585,7 @@ with colB:
     run = st.button("Run")
 
 # Editor: add/remove stocks
-with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
+with st.expander("➕ Add or ➖ remove stocks (saved; Git-backed)"):
     c1, c2 = st.columns([1.2, 1])
     with c1:
         st.markdown("**Add a stock**")
@@ -517,8 +597,9 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
             if a_ticker and a_name:
                 db_add_stock(a_ticker, a_name, a_region, a_curr)
                 st.success(f"Saved {a_name} ({a_ticker})")
-                if backup_db_to_s3():
-                    st.info("☁️ Cloud backup updated.")
+                ok,msg = sync_db_to_github("add/update stock")
+                st.info(f"↩︎ {msg}") if ok else st.warning(msg)
+                st.rerun()
             else:
                 st.warning("Please provide at least Ticker and Company name.")
     with c2:
@@ -529,16 +610,21 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
             tickers = [s[s.rfind("(")+1:-1] for s in rem_sel]
             db_remove_stocks(tickers)
             st.success(f"Removed {len(tickers)} stock(s)")
-            if backup_db_to_s3():
-                st.info("☁️ Cloud backup updated.")
+            ok,msg = sync_db_to_github("remove stocks")
+            st.info(f"↩︎ {msg}") if ok else st.warning(msg)
+            st.rerun()
 
     st.markdown("---")
-    st.markdown("**Backup & restore (DB)**")
-    if st.button("☁️ Backup DB now"):
-        if backup_db_to_s3():
-            st.success("Cloud backup updated.")
-        else:
-            st.warning("Cloud backup not configured (add S3_* to st.secrets).")
+    colx, coly = st.columns(2)
+    with colx:
+        if st.button("↗️ Push data to GitHub now"):
+            ok,msg = sync_db_to_github("manual push")
+            st.success(msg) if ok else st.warning(msg)
+    with coly:
+        if st.button("⬇️ Pull latest from GitHub"):
+            seed_db_from_github()
+            st.success("Pulled latest from repo.")
+            st.rerun()
 
     st.markdown("**Export / import stock list**")
     # Export current stocks to CSV
@@ -555,7 +641,6 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
     if up_stocks is not None:
         try:
             df_imp = pd.read_csv(up_stocks, encoding="utf-8-sig", keep_default_na=False)
-            # Accept flexible header cases
             cols = {c.strip().lower(): c for c in df_imp.columns}
             required = {"ticker","name","region","currency"}
             if not required.issubset(set(cols.keys())):
@@ -572,16 +657,16 @@ with st.expander("➕ Add or ➖ remove stocks (saved to SQLite)"):
                         db_add_stock(t, n, rg, cu)
                         count += 1
                 st.success(f"Imported/updated {count} stock(s).")
-                if backup_db_to_s3():
-                    st.info("☁️ Cloud backup updated.")
+                ok,msg = sync_db_to_github("stocks import")
+                st.info(f"↩︎ {msg}") if ok else st.warning(msg)
                 st.rerun()
         except Exception as e:
             st.exception(e)
 
 # ---- Manual YTD baseline manager
-with st.expander("🧭 Manual YTD baselines (set once at start of year)"):
+with st.expander("🧭 Manual YTD baselines (Git-backed; set once at start of year)"):
     cur_year = st.number_input("Year", min_value=2000, max_value=2100, value=selected_date.year, step=1)
-    st.caption("Each row defines the **baseline price** used for YTD % for that ticker in this year. Price should match the series you want to mirror (Yahoo typically uses Close).")
+    st.caption("Each row defines the baseline price used for YTD % for that ticker in this year. Price should match the series you want to mirror (Yahoo typically uses Close).")
 
     # Quick add form
     c1, c2, c3, c4 = st.columns([1.2, 0.8, 0.8, 1])
@@ -600,32 +685,48 @@ with st.expander("🧭 Manual YTD baselines (set once at start of year)"):
             price_val = float(b_price)
             db_set_reference(b_ticker, int(cur_year), price_val, b_date.strip() or None, b_series, b_notes.strip() or None)
             st.success(f"Baseline saved for {b_ticker} ({cur_year}): {price_val}")
-            if backup_db_to_s3():
-                st.info("☁️ Cloud backup updated.")
+            ok,msg = sync_db_to_github("baseline upsert")
+            st.info(f"↩︎ {msg}") if ok else st.warning(msg)
         except Exception as e:
             st.error(f"Could not save baseline: {e}")
 
-    # CSV import/export (tolerant importer)
+    # --- CSV/Excel import/export (tolerant) ---
     st.markdown("**Bulk import / export**")
-    st.caption("CSV columns: ticker, year, price, date (optional), series (close|adjclose, optional), notes (optional)")
-    up = st.file_uploader("Upload CSV to import/update baselines", type=["csv"])
+    st.caption("Accepted: CSV or Excel. Columns: ticker, year, price, date (optional), series (close|adjclose, optional), notes (optional)")
+
+    def _read_baseline_upload(upfile) -> pd.DataFrame:
+        name = upfile.name.lower()
+        if name.endswith((".xlsx", ".xls")):
+            return pd.read_excel(upfile)
+        # CSV path with delimiter sniffing + BOM handling
+        upfile.seek(0)
+        raw = upfile.read()
+        text = raw.decode("utf-8-sig", errors="ignore")
+        import csv as _csv
+        try:
+            dialect = _csv.Sniffer().sniff(text[:10000])
+            sep = dialect.delimiter
+        except Exception:
+            sep = ","
+        from io import StringIO
+        return pd.read_csv(StringIO(text), sep=sep, keep_default_na=False)
+
+    up = st.file_uploader("Upload baselines file (CSV or Excel)", type=["csv","xlsx","xls"])
     if up is not None:
         try:
-            # handle BOM, flexible headers, blanks
-            df_imp = pd.read_csv(up, encoding="utf-8-sig", keep_default_na=False)
-            # normalize header names (lower + strip)
-            name_map = {c: c.strip().lower() for c in df_imp.columns}
-            inv = {v: k for k, v in name_map.items()}
-            required = {"ticker", "year", "price"}
-            if not required.issubset(set(name_map.values())):
-                st.error(f"CSV must include columns: {', '.join(sorted(required))}")
+            df_imp = _read_baseline_upload(up)
+            cols_norm = {c: c.strip().lower() for c in df_imp.columns}
+            inv = {v: k for k, v in cols_norm.items()}
+            price_key = next((k for k in ["price","baseline","baseline_price"] if k in inv), None)
+            if price_key is None or not {"ticker","year"}.issubset(set(inv)):
+                st.error("File must include at least: ticker, year, price (or baseline/baseline_price)")
             else:
                 tick = df_imp[inv["ticker"]].astype(str).str.strip()
                 yr   = pd.to_numeric(df_imp[inv["year"]], errors="coerce").astype("Int64")
-                pr   = pd.to_numeric(df_imp[inv["price"]], errors="coerce")
-                dt   = df_imp[inv["date"]] if "date" in name_map.values() else ""
-                ser  = df_imp[inv["series"]] if "series" in name_map.values() else ""
-                nts  = df_imp[inv["notes"]] if "notes" in name_map.values() else ""
+                pr   = pd.to_numeric(df_imp[price_key], errors="coerce")
+                dt   = df_imp[inv["date"]]   if "date"   in inv else ""
+                ser  = df_imp[inv["series"]] if "series" in inv else ""
+                nts  = df_imp[inv["notes"]]  if "notes"  in inv else ""
 
                 norm = pd.DataFrame({
                     "ticker": tick,
@@ -636,13 +737,12 @@ with st.expander("🧭 Manual YTD baselines (set once at start of year)"):
                     "notes": nts,
                 })
 
-                # drop invalids with a clear message
                 bad = norm[norm[["ticker","year","price"]].isna().any(axis=1) | (norm["ticker"] == "")]
                 if not bad.empty:
                     st.warning(f"Dropped {len(bad)} invalid row(s) (missing ticker/year/price).")
 
                 norm = norm[(norm["ticker"] != "") & norm["year"].notna() & norm["price"].notna()]
-                ok = 0
+                okcnt = 0
                 for _, r in norm.iterrows():
                     db_set_reference(
                         r["ticker"], int(r["year"]), float(r["price"]),
@@ -650,12 +750,12 @@ with st.expander("🧭 Manual YTD baselines (set once at start of year)"):
                         (None if pd.isna(r["series"]) or str(r["series"]).strip()=="" else str(r["series"])),
                         (None if pd.isna(r["notes"]) or str(r["notes"]).strip()=="" else str(r["notes"]))
                     )
-                    ok += 1
-                st.success(f"Imported/updated {ok} baseline(s).")
-                if ok > 0 and backup_db_to_s3():
-                    st.info("☁️ Cloud backup updated.")
+                    okcnt += 1
+                st.success(f"Imported/updated {okcnt} baseline(s).")
+                if okcnt > 0:
+                    ok,msg = sync_db_to_github("baseline import")
+                    st.info(f"↩︎ {msg}") if ok else st.warning(msg)
         except Exception as e:
-            # full traceback to actually see what's wrong
             st.exception(e)
 
     refs_df = db_all_references(cur_year).sort_values(["ticker","year"])
@@ -671,14 +771,15 @@ with st.expander("🧭 Manual YTD baselines (set once at start of year)"):
         del_sel = st.multiselect("Delete baselines", del_opts, [])
         if st.button("Delete selected baselines"):
             keys = []
-            for s in del_sel:
-                t = s[:s.rfind("(")].strip()
-                y = int(s[s.rfind("(")+1:-1])
+            for s_ in del_sel:
+                t = s_[:s_.rfind("(")].strip()
+                y = int(s_[s_.rfind("(")+1:-1])
                 keys.append((t,y))
             db_delete_references(keys)
             st.success(f"Deleted {len(keys)} baseline(s).")
-            if backup_db_to_s3():
-                st.info("☁️ Cloud backup updated.")
+            ok,msg = sync_db_to_github("baseline delete")
+            st.info(f"↩︎ {msg}") if ok else st.warning(msg)
+            st.rerun()
 
 # Stock selection for this run
 stocks_df = db_all_stocks()
@@ -703,7 +804,6 @@ if run:
     for s in selected_stocks:
         tkr = s["ticker"]
         try:
-            # Pull enough history for 5D calculation and display; session-date indexing
             hist = yf.download(
                 tkr,
                 start=f"{selected_date.year-1}-12-15",
@@ -714,12 +814,10 @@ if run:
             if hist.empty:
                 continue
 
-            # Last session on/before selected date (for display & 5D reference)
             price_eod, pos = last_close_on_or_before_date(hist, target_date, use_price_return)
             if pos is None:
                 continue
 
-            # Live price behavior (only when matching Yahoo style AND date is today)
             use_live = use_price_return and (target_date == today_date)
             live_price = None
             if use_live:
@@ -729,34 +827,30 @@ if run:
                 except Exception:
                     live_price = None
 
-            # Numerator price (today's live if available; else EOD close)
             price_num = float(live_price) if (live_price is not None) else float(price_eod)
 
-            # 5D change uses n sessions back from the EOD position
             c_5ago = close_n_trading_days_ago_by_pos(hist, pos, 5, use_price_return)
             chg_5d = None
             if c_5ago is not None and c_5ago != 0:
                 chg_5d = (price_num - c_5ago) / c_5ago * 100.0
 
-            # YTD %  (precedence: Manual → Official calendars → Yahoo chart → fallback)
             manual_used = False
             chg_ytd = None
 
-            # 1) Manual baseline
+            # Manual baseline
             manual_ref = db_get_reference(tkr, selected_date.year) if use_manual_baselines else None
             if manual_ref is not None:
                 base = float(manual_ref["price"])
                 chg_ytd = (price_num - base) / base * 100.0
                 manual_used = True
             else:
-                # 2) Official exchange calendars
+                # Official exchange calendars
                 base_val = None
-                baseline_session = None
                 if use_official_calendars and _HAS_XCALS:
                     baseline_session = official_prev_year_last_session(tkr, selected_date.year)
                     if baseline_session is not None:
                         base_val = baseline_from_hist_on_or_before(hist, baseline_session, use_price_return)
-                # 3) If official available, use it; else 4) Yahoo chart; else 5) fallback
+                # Yahoo chart or fallback
                 if base_val is not None and base_val != 0:
                     chg_ytd = (price_num - float(base_val)) / float(base_val) * 100.0
                 else:
@@ -833,7 +927,6 @@ if run:
     if not rows:
         st.warning("No stock data available for that date.")
     else:
-        # build & sort the result table
         df = (
             pd.DataFrame(rows)
               .sort_values(by=["Region", "Company"])
@@ -844,7 +937,6 @@ if run:
         df["Region"] = pd.Categorical(df["Region"], categories=region_order, ordered=True)
         df = df.sort_values(["Region", "Company"])
 
-        # Show a small badge column for manual baselines
         display_cols = ["Company","Manual","Price","5D % Change","YTD % Change"]
 
         for region in region_order:
@@ -857,7 +949,7 @@ if run:
             st.subheader(header)
             st.dataframe(g[display_cols], use_container_width=True)
 
-        # CSV export (unchanged headers; values formatted using chosen decimal places)
+        # CSV export
         REGION_LABELS = {
             "Ireland": f"Ireland ({currency_symbol('EUR')})",
             "UK":      f"UK ({currency_symbol('GBp')})",
